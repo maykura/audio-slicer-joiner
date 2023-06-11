@@ -92,40 +92,54 @@ class Slicer:
             if not is_leading_silence and not need_slice_middle:
                 silence_start = None
                 continue
+
             # Need slicing. Record the range of silent frames to be removed.
-            if i - silence_start <= self.max_sil_kept:
-                pos = rms_list[silence_start: i + 1].argmin() + silence_start
-                if silence_start == 0:
-                    sil_tags.append((0, pos))
+            # When there are multiple frames sharing the minimum rms value,
+            # pick the one that extends the kept silence as much as possible up to max_sil_kept, to respect the max_sil_kept setting
+            if silence_start == 0:
+                # For leading silence, use argmin() which selects the earliest frame with the minimum rms value
+                # to cut early and leave in as much silence as possible up to max_sil_kept
+                if i - silence_start <= self.max_sil_kept:
+                    pos_leading = rms_list[silence_start: i + 1].argmin() + silence_start
                 else:
-                    sil_tags.append((pos, pos))
-                clip_start = pos
-            elif i - silence_start <= self.max_sil_kept * 2:
-                pos = rms_list[i - self.max_sil_kept: silence_start + self.max_sil_kept + 1].argmin()
-                pos += i - self.max_sil_kept
-                pos_l = rms_list[silence_start: silence_start + self.max_sil_kept + 1].argmin() + silence_start
-                pos_r = rms_list[i - self.max_sil_kept: i + 1].argmin() + i - self.max_sil_kept
-                if silence_start == 0:
-                    sil_tags.append((0, pos_r))
-                    clip_start = pos_r
-                else:
-                    sil_tags.append((min(pos_l, pos), max(pos_r, pos)))
-                    clip_start = max(pos_r, pos)
+                    pos_leading = rms_list[i - self.max_sil_kept : i + 1].argmin() + i - self.max_sil_kept
+
+                sil_tags.append((0, pos_leading))
+                clip_start = pos_leading
             else:
-                pos_l = rms_list[silence_start: silence_start + self.max_sil_kept + 1].argmin() + silence_start
-                pos_r = rms_list[i - self.max_sil_kept: i + 1].argmin() + i - self.max_sil_kept
-                if silence_start == 0:
-                    sil_tags.append((0, pos_r))
+                if i - silence_start <= self.max_sil_kept * 2:
+                    # If the silent part is not in the beginning and is not long enough to contain max_sil_kept for both the previous clip and the next clip,
+                    # pick the frame with the minimum rms value that is closest to the center of the silent range
+                    # This keeps the silent parts on both end within max_sil_kept and prevents adding more silence than what is there originally.
+                    # This also makes sure the resulting clips do not have significantly asymmetrical parts of silence
+                    range_full = rms_list[silence_start: i + 1]
+                    pos = min(range(len(range_full)), key=lambda i: (range_full[i], abs(len(range_full) // 2 - i))) + silence_start
+
+                    sil_tags.append((pos, pos))
+                    clip_start = pos
                 else:
+                    # When the silent part is longer than two segments of max_sil_kept for both the previous clip and the next clip,
+                    # get each silent segment separately then cut as late as possible for the previous clip and as early as possible for the next clip
+                    # This maximizes the silence kept for each segment up to max_sil_kept
+                    range_l = rms_list[silence_start : silence_start + self.max_sil_kept + 1]
+                    range_r = rms_list[i - self.max_sil_kept : i + 1]
+                    pos_l = min(range(len(range_l)), key=lambda i: (range_l[i], -i)) + silence_start
+                    pos_r = range_r.argmin() + i - self.max_sil_kept
+
                     sil_tags.append((pos_l, pos_r))
-                clip_start = pos_r
+                    clip_start = pos_r
+
             silence_start = None
+
         # Deal with trailing silence.
         total_frames = rms_list.shape[0]
         if silence_start is not None and total_frames - silence_start >= self.min_interval:
             silence_end = min(total_frames, silence_start + self.max_sil_kept)
-            pos = rms_list[silence_start: silence_end + 1].argmin() + silence_start
-            sil_tags.append((pos, total_frames + 1))
+            range_end = rms_list[silence_start: silence_end + 1]
+            # Pick the last frame with the minimum rms value to extend the trailing silence as much as possible up to max_sil_kept
+            pos_trail = min(range(len(range_end)), key=lambda i: (range_end[i], -i)) + silence_start
+            sil_tags.append((pos_trail, total_frames + 1))
+
         # Apply and return slices.
         if len(sil_tags) == 0:
             return [waveform]
