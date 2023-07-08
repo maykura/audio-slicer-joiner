@@ -45,7 +45,8 @@ class Slicer:
                  min_length: int = 5000,
                  min_interval: int = 300,
                  hop_size: int = 20,
-                 max_sil_kept: int = 5000):
+                 max_sil_kept: int = 5000,
+                 override_interval: int = 0):
         if not min_length >= min_interval >= hop_size:
             raise ValueError('The following condition must be satisfied: min_length >= min_interval >= hop_size')
         if not max_sil_kept >= hop_size:
@@ -57,6 +58,7 @@ class Slicer:
         self.min_length = round(sr * min_length / 1000 / self.hop_size)
         self.min_interval = round(min_interval / self.hop_size)
         self.max_sil_kept = round(sr * max_sil_kept / 1000 / self.hop_size)
+        self.override_interval = round(sr * override_interval / 1000 / self.hop_size)
 
     def _apply_slice(self, waveform, begin, end):
         if len(waveform.shape) > 1:
@@ -88,7 +90,8 @@ class Slicer:
                 continue
             # Clear recorded silence start if interval is not enough or clip is too short
             is_leading_silence = silence_start == 0 and i > self.max_sil_kept
-            need_slice_middle = i - silence_start >= self.min_interval and i - clip_start >= self.min_length
+            need_slice_middle = i - silence_start >= self.min_interval \
+                and (i - clip_start >= self.min_length or (self.override_interval > 0 and i - silence_start > self.override_interval))
             if not is_leading_silence and not need_slice_middle:
                 silence_start = None
                 continue
@@ -160,6 +163,8 @@ def main():
                         help='Frame length in milliseconds')
     parser.add_argument('--max_sil_kept', type=int, required=False, default=500,
                         help='The maximum silence length kept around the sliced clip, presented in milliseconds')
+    parser.add_argument('--override_interval', type=int, required=False, default=-1,
+                        help='When a silence part exceeds this interval in milliseconds, ignore the min_length requirement and proceeds to slice')
     args = parser.parse_args()
     out = args.out
     if out is None:
