@@ -1,4 +1,5 @@
 import numpy as np
+import numpy.typing as npt
 
 
 # This function is obtained from librosa.
@@ -9,6 +10,12 @@ def get_rms(
     hop_length=512,
     pad_mode="constant",
 ):
+    # get_rms only works with floating point audio scaled between -1 to 1
+    # convert the input audio to that if it is integer audio
+    if np.issubdtype(y.dtype, np.integer):
+        y = y.astype(np.float32, order='C') / max(abs(np.iinfo(y.dtype).max), abs(np.iinfo(y.dtype).min))
+        # (numpy will automatically cast to higher precision if needed to prevent information loss)
+
     padding = (int(frame_length // 2), int(frame_length // 2))
     y = np.pad(y, padding, mode=pad_mode)
 
@@ -37,6 +44,29 @@ def get_rms(
 
     return np.sqrt(power)
 
+
+def get_bit_depth(subtype: str) -> npt.DTypeLike:
+    match subtype:
+        case 'PCM_16' | 'PCM_S8' | 'ALAC_16':
+            return np.int16
+        case 'PCM_32':
+            return np.int32
+        case 'DOUBLE':
+            return np.float64
+        case _:
+            return np.float32
+
+
+def get_subtype(dtype: npt.DTypeLike) -> str:
+    match dtype:
+        case np.int16:
+            return 'PCM_16'
+        case np.int32:
+            return 'PCM_32'
+        case np.float64:
+            return 'DOUBLE'
+        case _:
+            return 'FLOAT'
 
 class Slicer:
     def __init__(self,
@@ -178,7 +208,8 @@ def main():
 
     for path in tqdm(audio_paths, desc="Slicing..."):
         try:
-            audio, sr = librosa.load(path, sr=None, mono=False)
+            with soundfile.SoundFile(path) as file:
+                audio, sr = librosa.load(path, sr=None, mono=False, dtype=get_bit_depth(file.subtype))
         except:
             print(f"Error loading {path} as an audio file")
             continue
@@ -194,7 +225,10 @@ def main():
         for i, chunk in enumerate(chunks):
             if len(chunk.shape) > 1:
                 chunk = chunk.T
-            soundfile.write(os.path.join(out, f'%s_%d.wav' % (os.path.basename(path).rsplit('.', maxsplit=1)[0], i)), chunk, sr)
+            soundfile.write(file=os.path.join(out, f'%s_%d.wav' % (os.path.basename(path).rsplit('.', maxsplit=1)[0], i)),
+                            data=chunk,
+                            samplerate=sr,
+                            subtype=get_subtype(chunk.dtype))
 
 
 if __name__ == '__main__':
