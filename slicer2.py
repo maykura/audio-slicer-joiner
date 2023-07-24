@@ -1,5 +1,11 @@
 import numpy as np
 import numpy.typing as npt
+from sortedcontainers import SortedKeyList
+import os.path
+from tqdm.auto import tqdm
+import librosa
+import soundfile
+import warnings
 
 
 # This function is obtained from librosa.
@@ -68,6 +74,29 @@ def get_subtype(dtype: npt.DTypeLike) -> str:
         case _:
             return 'FLOAT'
 
+
+def upgrade_channels(waveform: np.array, out_channels: int) -> np.array:
+    in_channels = len(waveform.shape)
+    if in_channels >= out_channels:
+        return waveform
+    elif in_channels > 1:
+        raise ValueError("Only mono-to-multi channels conversion is supported")
+
+    output = np.repeat(waveform[:, np.newaxis], out_channels, axis=1)
+    return output
+
+
+def compare_bitdepth(left: npt.DTypeLike, right: npt.DTypeLike) -> npt.DTypeLike:
+    """
+    Compares two numpy datatypes and return the one that the other can be safely cast to.
+    Returns float64 as default if neither operand can be cast to the other.
+    """
+    if left != right and not (np.dtype(left) < np.dtype(right)) and not (np.dtype(left) > np.dtype(right)):
+        return np.float64
+    else:
+        return max(np.dtype(left), np.dtype(right))
+
+
 class Slicer:
     def __init__(self,
                  sr: int,
@@ -94,14 +123,16 @@ class Slicer:
         else:
             return waveform[begin * self.hop_size: min(waveform.shape[0], end * self.hop_size)]
 
-    # @timeit
-    def slice(self, waveform):
+    def find_slices(self, waveform):
         if len(waveform.shape) > 1:
             samples = waveform.mean(axis=0)
         else:
             samples = waveform
-        if (samples.shape[0] + self.hop_size - 1) // self.hop_size <= self.min_length:
-            return [waveform]
+
+        length = (samples.shape[0] + self.hop_size - 1) // self.hop_size
+        if length <= self.min_length:
+            return [(0, length)]
+
         rms_list = get_rms(y=samples, frame_length=self.win_size, hop_length=self.hop_size).squeeze(0)
         sil_tags = []
         silence_start = None
@@ -158,25 +189,175 @@ class Slicer:
             sil_tags.append((pos, total_frames + 1))
         # Apply and return slices.
         if len(sil_tags) == 0:
-            return [waveform]
+            return [(0, length)]
         else:
-            chunks = []
+            slices = []
             if sil_tags[0][0] > 0:
-                chunks.append(self._apply_slice(waveform, 0, sil_tags[0][0]))
+                slices.append((0, sil_tags[0][0]))
             for i in range(len(sil_tags) - 1):
-                chunks.append(self._apply_slice(waveform, sil_tags[i][1], sil_tags[i + 1][0]))
+                slices.append((sil_tags[i][1], sil_tags[i + 1][0]))
             if sil_tags[-1][1] < total_frames:
-                chunks.append(self._apply_slice(waveform, sil_tags[-1][1], total_frames))
-            return chunks
+                slices.append((sil_tags[-1][1], total_frames))
+
+            return slices
+
+    # @timeit
+    def slice(self, waveform):
+        chunks = []
+        for chunk in self.find_slices(waveform):
+            chunks.append(self._apply_slice(waveform, chunk[0], chunk[1]))
+        return chunks
+
+
+class Joiner:
+    """
+    Provides an interface for building an index to keep track of audio slices that can then be joined together
+
+    Attributes:
+        index (SortedKeyList): The index to keep track of all the audio slices.
+            Implemented as a sortedcontainers.SortedKeyList with the following keys::
+                - path: full path to the audio file containing the slice.
+                - length: length of the slice, in milliseconds.
+                - start: start time of the slice within the audio file, in milliseconds.
+    """
+    def __init__(self, index: SortedKeyList = SortedKeyList(key=lambda d: d['length'])):
+        self.index = index
+
+    @property
+    def index(self) -> SortedKeyList:
+        return self._index
+
+    @index.setter
+    def index(self, value: SortedKeyList):
+        if type(value) != SortedKeyList:
+            raise ValueError("index must be a SortedKeyList!")
+        self._index = value
+
+    def append_index(self, path: str, length: int, start: int):
+        self._index.add({'path': path, 'length': length, 'start': start})
+
+    @staticmethod
+    def create_index_from_files(in_path: str, rejoin_length: int) -> SortedKeyList:
+        """
+        Returns a SortedKeyList that indexes each audio file from the given directory as a single slice.
+
+        NOTE that this simply creates and returns a new index without modifying any Joiner object's index attribute
+        """
+        if rejoin_length <= 0:
+            raise ValueError("Rejoin_length is zero or less. Cannot create index")
+
+        index = SortedKeyList(key=lambda d: d['length'])
+        paths = []
+        if os.path.isfile(in_path):
+            paths.append(in_path)
+        elif os.path.isdir(in_path):
+            for root, dirs, files in os.walk(in_path):
+                for file in files:
+                    paths.append(os.path.join(root, file))
+        else:
+            raise ValueError("Invalid path")
+
+        for path in paths:
+            sf = soundfile.SoundFile(path)
+            index.add({'path': path, 'length': sf.frames / sf.samplerate * 1000, 'start': 0})
+
+        return index
+
+    def join(self, rejoin_length: int, out_path: str, in_path: str = None):
+        """
+        Args:
+            rejoin_length: Maximum duration of each file containing the joined segments, in milliseconds.
+            out_path: Output directory for the files containing the joined segments.
+                Path will be created if it doesn't exist already.
+            in_path: If specified, each audio file in the specified directory will be considered as a single slice
+                and be used for joining, and the index attribute will be ignored.
+                If not specified, the index attribute will be used for joining.
+        """
+        if rejoin_length <= 0:
+            warnings.warn("Rejoin_length is zero or less. Nothing to do")
+            return
+        if not os.path.exists(out_path):
+            os.makedirs(out_path)
+
+        # Build index from files if in_path is specified, otherwise copy the index property
+        if in_path is not None:
+            index = self.create_index_from_files(in_path, rejoin_length)
+        else:
+            index = self._index.copy()
+
+        if len(index) <= 0:
+            warnings.warn("Index is empty, nothing to do")
+            return
+
+        out_files = []
+        # Iterate through the index from the longest segment and join it with shorter segments to fill the gap until rejoin_length is met
+        while len(index) > 0:
+            segment = index.pop()
+            out_files.append([segment])
+
+            gap = rejoin_length - segment['length']
+            if segment['length'] >= rejoin_length:
+                continue
+
+            # Keep finding segments that fit in the gap and join them
+            # until not even the shortest segment left in the index can fit in the gap
+            while len(index) > 0 and gap >= index[0]['length']:
+                # Use bisect_key_left() to find the index position of the segment whose duration matches exactly to the gap
+                # If there is no such segment, bisect_key_left() would return the position of the first segment that exceeds the gap
+                # Subtract 1 to get the position of longest segment that fits in the gap
+                insert_i = index.bisect_key_left(gap)
+                if insert_i < len(index) and index[insert_i]['length'] <= gap:
+                    insert = index.pop(insert_i)
+                else:
+                    insert = index.pop(insert_i-1)
+
+                out_files[-1].append(insert)
+                gap -= insert['length']
+
+        for file in tqdm(out_files, desc="Re-joining and writing to files..."):
+            max_channels = 0
+            max_samplerate = 0
+            # Set to a minimum bit depth of int16 since that's the lowest bit depth this script would accept
+            max_bitdepth = np.dtype(np.int16)
+
+            # Iterate through all the segments in the file once first to determine the max sample rate, bit depth,
+            # and channels count that all segments should be converted to later
+            for seg in file:
+                sf = soundfile.SoundFile(seg['path'])
+                # Bit depth must be at least float32 if resampling is needed
+                if max_samplerate != 0 and max_samplerate != sf.samplerate:
+                    max_bitdepth = compare_bitdepth(np.dtype(np.float32), compare_bitdepth(max_bitdepth, np.dtype(get_bit_depth(sf.subtype))))
+                else:
+                    max_bitdepth = compare_bitdepth(max_bitdepth, np.dtype(get_bit_depth(sf.subtype)))
+
+                max_channels = max(max_channels, sf.channels)
+                max_samplerate = max(max_samplerate, sf.samplerate)
+                sf.close()
+
+            chunk_list = []
+            filename = ""
+            for seg in file:
+                # Set sr to None if resampling is not needed.
+                # When a sr value other None is passed to librosa it would always convert the audio to float32 even if there is no need of resampling
+                sr = max_samplerate if librosa.get_samplerate(seg['path']) != max_samplerate else None
+                chunk, _ = librosa.load(seg['path'], sr=sr, mono=False, dtype=max_bitdepth, offset=(seg['start']/1000), duration=(seg['length']/1000))
+                if len(chunk.shape) > 1:
+                    chunk = chunk.T
+                chunk = upgrade_channels(chunk, max_channels)
+                chunk_list += chunk.tolist()
+                filename += os.path.basename(seg['path']).rsplit('.', maxsplit=1)[0] + f"_{seg['start']//1000}-"
+
+            # For the filename, first remove the trailing delimiter character (-)
+            # Then to account for the maximum length for a path in Windows, which is 259 characters, subtract ".wav" = 255
+            # Then subtract the directory path to get the max filename length
+            soundfile.write(file=os.path.join(out_path, f'%s.wav' % filename[:-1][:255-len(out_path)]),
+                            data=np.array(chunk_list, dtype=max_bitdepth),
+                            samplerate=max_samplerate,
+                            subtype=get_subtype(max_bitdepth))
 
 
 def main():
-    import os.path
     from argparse import ArgumentParser
-    from tqdm.auto import tqdm
-
-    import librosa
-    import soundfile
 
     parser = ArgumentParser()
     parser.add_argument('audio', type=str, help='The audio file or path containing audio files to be sliced')
@@ -191,6 +372,8 @@ def main():
                         help='Frame length in milliseconds')
     parser.add_argument('--max_sil_kept', type=int, required=False, default=500,
                         help='The maximum silence length kept around the sliced clip, presented in milliseconds')
+    parser.add_argument('--rejoin_length', type=int, required=False, default=-1,
+                        help='Re-join slices into segments of length in milliseconds. Values below 1 disable rejoining')
     args = parser.parse_args()
     out = args.out
     if out is None:
@@ -205,6 +388,8 @@ def main():
         for root, dirs, files in os.walk(args.audio):
             for file in files:
                 audio_paths.append(os.path.join(root, file))
+
+    joiner = Joiner()
 
     for path in tqdm(audio_paths, desc="Slicing..."):
         try:
@@ -221,15 +406,23 @@ def main():
             hop_size=args.hop_size,
             max_sil_kept=args.max_sil_kept
         )
-        chunks = slicer.slice(audio)
-        for i, chunk in enumerate(chunks):
-            if len(chunk.shape) > 1:
-                chunk = chunk.T
-            soundfile.write(file=os.path.join(out, f'%s_%d.wav' % (os.path.basename(path).rsplit('.', maxsplit=1)[0], i)),
-                            data=chunk,
-                            samplerate=sr,
-                            subtype=get_subtype(chunk.dtype))
+        if args.rejoin_length > 0:
+            chunks = slicer.find_slices(audio)
+            for chunk in chunks:
+                joiner.append_index(path, (chunk[1] - chunk[0]) * args.hop_size, chunk[0] * args.hop_size)
+        else:
+            chunks = slicer.slice(audio)
+            for i, chunk in enumerate(chunks):
+                if len(chunk.shape) > 1:
+                    chunk = chunk.T
+                soundfile.write(
+                    file=os.path.join(out, f'%s_%d.wav' % (os.path.basename(path).rsplit('.', maxsplit=1)[0], i)),
+                    data=chunk,
+                    samplerate=sr,
+                    subtype=get_subtype(chunk.dtype))
 
+    if args.rejoin_length > 0:
+        joiner.join(rejoin_length=args.rejoin_length, out_path=out)
 
 if __name__ == '__main__':
     main()
