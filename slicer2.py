@@ -143,12 +143,13 @@ class Slicer:
 def main():
     import os.path
     from argparse import ArgumentParser
+    from tqdm.auto import tqdm
 
     import librosa
     import soundfile
 
     parser = ArgumentParser()
-    parser.add_argument('audio', type=str, help='The audio to be sliced')
+    parser.add_argument('audio', type=str, help='The audio file or path containing audio files to be sliced')
     parser.add_argument('--out', type=str, help='Output directory of the sliced audio clips')
     parser.add_argument('--db_thresh', type=float, required=False, default=-40,
                         help='The dB threshold for silence detection')
@@ -164,22 +165,36 @@ def main():
     out = args.out
     if out is None:
         out = os.path.dirname(os.path.abspath(args.audio))
-    audio, sr = librosa.load(args.audio, sr=None, mono=False)
-    slicer = Slicer(
-        sr=sr,
-        threshold=args.db_thresh,
-        min_length=args.min_length,
-        min_interval=args.min_interval,
-        hop_size=args.hop_size,
-        max_sil_kept=args.max_sil_kept
-    )
-    chunks = slicer.slice(audio)
-    if not os.path.exists(out):
+    elif not os.path.exists(out):
         os.makedirs(out)
-    for i, chunk in enumerate(chunks):
-        if len(chunk.shape) > 1:
-            chunk = chunk.T
-        soundfile.write(os.path.join(out, f'%s_%d.wav' % (os.path.basename(args.audio).rsplit('.', maxsplit=1)[0], i)), chunk, sr)
+
+    audio_paths = []
+    if os.path.isfile(args.audio):
+        audio_paths.append(args.audio)
+    elif os.path.isdir(args.audio):
+        for root, dirs, files in os.walk(args.audio):
+            for file in files:
+                audio_paths.append(os.path.join(root, file))
+
+    for path in tqdm(audio_paths, desc="Slicing..."):
+        try:
+            audio, sr = librosa.load(path, sr=None, mono=False)
+        except:
+            print(f"Error loading {path} as an audio file")
+            continue
+        slicer = Slicer(
+            sr=sr,
+            threshold=args.db_thresh,
+            min_length=args.min_length,
+            min_interval=args.min_interval,
+            hop_size=args.hop_size,
+            max_sil_kept=args.max_sil_kept
+        )
+        chunks = slicer.slice(audio)
+        for i, chunk in enumerate(chunks):
+            if len(chunk.shape) > 1:
+                chunk = chunk.T
+            soundfile.write(os.path.join(out, f'%s_%d.wav' % (os.path.basename(path).rsplit('.', maxsplit=1)[0], i)), chunk, sr)
 
 
 if __name__ == '__main__':
